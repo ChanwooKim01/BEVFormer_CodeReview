@@ -138,19 +138,24 @@ class SpatialCrossAttention(BaseModule):
         
         # V_hit을 구하는 과정?
         for i, mask_per_img in enumerate(bev_mask):
-            index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1)
+            # 0보다 큰 값이 있는 index만 추출 -> squeeze로 1차원 벡터로 변환
+            # mask_per_img[0].sum(-1): num_camera 크기만큼의 벡터, 벡터의 각 값에는 True에 해당되는 값의 개수가 들어있음
+            # nonzero().squeeze(-1): 0이 아닌 값의 index를 추출하고, 1차원 벡터로 변환
+            # 결론: 0이 아닌 값을 가지는 카메라 index, 즉 V_hit을 추출한다
+            index_query_per_img = mask_per_img[0].sum(-1).nonzero().squeeze(-1) 
             indexes.append(index_query_per_img)
         max_len = max([len(each) for each in indexes])
 
-        # each camera only interacts with its corresponding BEV queries. This step can  greatly save GPU memory.
+        # each camera only interacts with its corresponding BEV queries. This step can greatly save GPU memory.
         queries_rebatch = query.new_zeros(
             [bs, self.num_cams, max_len, self.embed_dims])
         reference_points_rebatch = reference_points_cam.new_zeros(
             [bs, self.num_cams, max_len, D, 2])
         
+        # 뭐 메모리 효율적인 부분이라네
         for j in range(bs):
             for i, reference_points_per_img in enumerate(reference_points_cam):   
-                index_query_per_img = indexes[i]
+                index_query_per_img = indexes[i] # V_hit
                 queries_rebatch[j, i, :len(index_query_per_img)] = query[j, index_query_per_img]
                 reference_points_rebatch[j, i, :len(index_query_per_img)] = reference_points_per_img[j, index_query_per_img]
 
@@ -167,14 +172,19 @@ class SpatialCrossAttention(BaseModule):
                                             level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
         for j in range(bs):
             for i, index_query_per_img in enumerate(indexes):
-                slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)]
+                # 기존 slots: zero tensor
+                # queries: SCA 결과
+                slots[j, index_query_per_img] += queries[j, i, :len(index_query_per_img)] 
 
         count = bev_mask.sum(-1) > 0
         count = count.permute(1, 2, 0).sum(-1)
         count = torch.clamp(count, min=1.0)
+        
+        # V_hit 개수만큼 나눠주는 부분
         slots = slots / count[..., None]
+        # output_proj: linear layer
         slots = self.output_proj(slots)
-
+        # inp_residual: query 원본
         return self.dropout(slots) + inp_residual
 
 
@@ -245,7 +255,7 @@ class MSDeformableAttention3D(BaseModule):
         self.embed_dims = embed_dims
         self.num_levels = num_levels
         self.num_heads = num_heads
-        self.num_points = num_points
+        self.num_points = num_points # 8
         self.sampling_offsets = nn.Linear(
             embed_dims, num_heads * num_levels * num_points * 2)
         self.attention_weights = nn.Linear(embed_dims,
@@ -335,12 +345,16 @@ class MSDeformableAttention3D(BaseModule):
         bs, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
+        # value_proj: linear layer
         value = self.value_proj(value)
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)
-        sampling_offsets = self.sampling_offsets(query).view(
-            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+        # sampling_offsets: linear layer
+        # num_heads * num_levels * num_points * 2 차원 output
+        sampling_offsets = self.sampling_offsets(query).view(  
+            bs, num_query, self.num_heads, self.num_levels, self.num_points, 2) # num_level: 4, num_points: 8
+        # attention_weights: linear layer
         attention_weights = self.attention_weights(query).view(
             bs, num_query, self.num_heads, self.num_levels * self.num_points)
 
@@ -358,16 +372,35 @@ class MSDeformableAttention3D(BaseModule):
             For each referent point, we sample `num_points` sampling points.
             For `num_Z_anchors` reference points,  it has overall `num_points * num_Z_anchors` sampling points.
             """
+            
+            """
+            1. BEV query 하나 당 Z_anchor 개수만큼의 3D points를 가짐
+            2. 이 3D points를 projection
+            3. 이 projection된 Z_anchor개의 2D points에서, 각 2D point마다 num_points개의 sampling points를 수행 (Deformable attention)
+            결론: 한 BEV query 당 총 num_points * num_Z_anchors 개의 2D sampling points가 존재
+            """
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
 
             bs, num_query, num_Z_anchors, xy = reference_points.shape
+            
+            # 기존 shape: (bs, num_query, num_Z_anchors, 2)
+            # 바뀐 shape: (bs, num_query, 1, 1, 1, num_Z_anchors, 2)
+            # None이 뭔데?: 차원 추가하는 부분이라 생각하면 된다!
             reference_points = reference_points[:, :, None, None, None, :, :]
+            
+            # sampling offset을 정규화
             sampling_offsets = sampling_offsets / \
                 offset_normalizer[None, None, None, :, None, :]
-            bs, num_query, num_heads, num_levels, num_all_points, xy = sampling_offsets.shape
+            bs, num_query, num_heads, num_levels, num_all_points, xy = sampling_offsets.shape # num_all_points == self.num_points
+            # self.num_points = num_all_points다!!
+            # sampling_offsets.shape = (bs, num_query, num_heads, num_levels, num_all_points, 2)
+            
+            # 앵커 개수: 4개
+            # sample_offset 개수: 2개인 건가?
             sampling_offsets = sampling_offsets.view(
                 bs, num_query, num_heads, num_levels, num_all_points // num_Z_anchors, num_Z_anchors, xy)
+            # sampling points에 가해질 offset이 적용된 위치들
             sampling_locations = reference_points + sampling_offsets
             bs, num_query, num_heads, num_levels, num_points, num_Z_anchors, xy = sampling_locations.shape
             assert num_all_points == num_points * num_Z_anchors
@@ -386,6 +419,7 @@ class MSDeformableAttention3D(BaseModule):
         #  attention_weights.shape: bs, num_query, num_heads, num_levels, num_all_points
         #
 
+        # deformable attention 수행
         if torch.cuda.is_available() and value.is_cuda:
             if value.dtype == torch.float16:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32

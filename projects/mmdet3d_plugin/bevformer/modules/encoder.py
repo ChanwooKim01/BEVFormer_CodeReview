@@ -33,6 +33,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
             `LN`.
     """
 
+    # transformerlayers: BEVFormerLayer
     def __init__(self, *args, pc_range=None, num_points_in_pillar=4, return_intermediate=False, dataset_type='nuscenes',
                  **kwargs):
 
@@ -86,6 +87,8 @@ class BEVFormerEncoder(TransformerLayerSequence):
             ref_2d = ref_2d.repeat(bs, 1, 1).unsqueeze(2)
             return ref_2d
 
+    # Spatial Cross-Attention을 위해 필요한 부분
+    # reference points를 이미지 좌표계로 변환 -> 이미지 영역 내에 있는지 확인 후 마스크 생성
     # This function must use fp32!!!
     @force_fp32(apply_to=('reference_points', 'img_metas'))
     def point_sampling(self, reference_points, pc_range,  img_metas):
@@ -140,7 +143,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
         reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
         reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
 
-        # 모든 카메라, 배치, 쿼리에 대해 해당 reference points가 이미지 안에 있을 경우 True
+        # 해당 reference points가 이미지 안에 있을 경우 True
         bev_mask = (bev_mask & (reference_points_cam[..., 1:2] > 0.0)
                     & (reference_points_cam[..., 1:2] < 1.0)
                     & (reference_points_cam[..., 0:1] < 1.0)
@@ -153,27 +156,28 @@ class BEVFormerEncoder(TransformerLayerSequence):
 
         reference_points_cam = reference_points_cam.permute(2, 1, 3, 0, 4)
         bev_mask = bev_mask.permute(2, 1, 3, 0, 4).squeeze(-1)
-
+        
         torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         torch.backends.cudnn.allow_tf32 = allow_tf32
 
+        # 최종 출력, cam좌표계에서의 reference points와 이미지 영역 내에 있는지 여부
         return reference_points_cam, bev_mask
 
     @auto_fp16()
     def forward(self,
-                bev_query,
-                key,
-                value,
-                *args,
-                bev_h=None,
-                bev_w=None,
-                bev_pos=None,
-                spatial_shapes=None,
-                level_start_index=None,
-                valid_ratios=None,
-                prev_bev=None,
-                shift=0.,
-                **kwargs):
+                bev_query, #
+                key, #
+                value, #
+                *args, # 애는 어디서도 받아오는 애가 없는 거 같은데... 빈 값인 것 같기도
+                bev_h=None, #
+                bev_w=None, #
+                bev_pos=None, #
+                spatial_shapes=None, #
+                level_start_index=None, #
+                valid_ratios=None, #
+                prev_bev=None, #
+                shift=0., #
+                **kwargs): #
         """Forward function for `TransformerDecoder`.
         Args:
             bev_query (Tensor): Input BEV query with shape
@@ -196,22 +200,37 @@ class BEVFormerEncoder(TransformerLayerSequence):
         output = bev_query
         intermediate = []
 
+        # 3d reference points for spatial cross-attention (BEV 평면 + height anchor)
         ref_3d = self.get_reference_points(
             bev_h, bev_w, self.pc_range[5]-self.pc_range[2], self.num_points_in_pillar, dim='3d', bs=bev_query.size(1),  device=bev_query.device, dtype=bev_query.dtype)
+        # 2d reference points for temporal self-attention (BEV 평면 위)
         ref_2d = self.get_reference_points(
             bev_h, bev_w, dim='2d', bs=bev_query.size(1), device=bev_query.device, dtype=bev_query.dtype)
 
+        # SCA를 위한 이미지 좌표계로의 매핑 및 마스킹
         reference_points_cam, bev_mask = self.point_sampling(
             ref_3d, self.pc_range, kwargs['img_metas'])
 
+        # ref_2d: 현재 timestamp의 ref 2d
+        # shift_ref_2d: 이전 timestamp의 ref 2d에 shift를 더한 값. 즉, 이전 timestamp의 ref 2d
+        
         # bug: this code should be 'shift_ref_2d = ref_2d.clone()', we keep this bug for reproducing our results in paper.
+        # 원래 논문 코드는 clone()을 빼고 수행했다.
+        # 논문 의도대로 구현하는 게 목적: ref_2d.clone()
+        # 논문 실험 결과를 그대로 내보고 싶다: ref_2d 그대로 사용하여 구현
         shift_ref_2d = ref_2d.clone()
+        # 이전 timestamp의 ref 2d에 shift를 더함
         shift_ref_2d += shift[:, None, None, :]
 
         # (num_query, bs, embed_dims) -> (bs, num_query, embed_dims)
         bev_query = bev_query.permute(1, 0, 2)
         bev_pos = bev_pos.permute(1, 0, 2)
         bs, len_bev, num_bev_level, _ = ref_2d.shape
+        
+        # prev_bev가 있을 시, 현재 bev query와 prev bev를 stack하여 새로운 feature V를 생성
+        # 이 V를 attention의 value로 사용
+        
+        # prev bev에선 현재 좌표계로 alignment가 되지 않았다. alignment된 건 오직 ref 2d뿐
         if prev_bev is not None:
             prev_bev = prev_bev.permute(1, 0, 2)
             prev_bev = torch.stack(
@@ -222,7 +241,8 @@ class BEVFormerEncoder(TransformerLayerSequence):
             hybird_ref_2d = torch.stack([ref_2d, ref_2d], 1).reshape(
                 bs*2, len_bev, num_bev_level, 2)
 
-        for lid, layer in enumerate(self.layers):
+        # BEVFormerLayer forward
+        for lid, layer in enumerate(self.layers): #encoder layers 의 각 layer들
             output = layer(
                 bev_query,
                 key,
@@ -240,7 +260,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 prev_bev=prev_bev,
                 **kwargs)
 
-            bev_query = output
+            bev_query = output # 현재의 output bev query를 저장 -> 다음 layer에 입력으로 사용
             if self.return_intermediate:
                 intermediate.append(output)
 
@@ -313,7 +333,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                 bev_h=None,
                 bev_w=None,
                 reference_points_cam=None,
-                mask=None,
+                mask=None, # ?????? 얘가 bev_mask인 거 같은데 왜 mask로 바뀌었지
                 spatial_shapes=None,
                 level_start_index=None,
                 prev_bev=None,
@@ -353,6 +373,10 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
         attn_index = 0
         ffn_index = 0
         identity = query
+        
+        # 어텐션 과정에서 어떤 부분을 볼 지, 보지 않을지를 결정 (마스킹)
+        # -inf로 아마 마스킹이 되지 않을까?
+        # 근데 아마 attn_masks 값은 디폴트로는 None인 것 같다
         if attn_masks is None:
             attn_masks = [None for _ in range(self.num_attn)]
         elif isinstance(attn_masks, torch.Tensor):
@@ -374,12 +398,12 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                     query,
                     prev_bev,
                     prev_bev,
-                    identity if self.pre_norm else None,
+                    identity if self.pre_norm else None, # identity == query
                     query_pos=bev_pos,
                     key_pos=bev_pos,
                     attn_mask=attn_masks[attn_index],
                     key_padding_mask=query_key_padding_mask,
-                    reference_points=ref_2d,
+                    reference_points=ref_2d, # hybrid ref 2d
                     spatial_shapes=torch.tensor(
                         [[bev_h, bev_w]], device=query.device),
                     level_start_index=torch.tensor([0], device=query.device),
@@ -402,7 +426,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                     key_pos=key_pos,
                     reference_points=ref_3d,
                     reference_points_cam=reference_points_cam,
-                    mask=mask,
+                    mask=mask, # 얘가 bev_mask가 맞는 거 같긴 하다. 근데 이거 왜 오류가 안 나지..?
                     attn_mask=attn_masks[attn_index],
                     key_padding_mask=key_padding_mask,
                     spatial_shapes=spatial_shapes,
@@ -564,8 +588,8 @@ class MM_BEVFormerLayer(MyCustomBaseTransformerLayer):
             elif layer == 'cross_attn':
                 new_query1 = self.attentions[attn_index](
                     query,
-                    key,
-                    value,
+                    key, # key from multi-cam images (feat_flatten)
+                    value, # value from multi-cam images (feat_flatten)
                     identity if self.pre_norm else None,
                     query_pos=query_pos,
                     key_pos=key_pos,

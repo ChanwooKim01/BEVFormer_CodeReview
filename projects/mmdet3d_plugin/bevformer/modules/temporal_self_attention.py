@@ -174,6 +174,8 @@ class TemporalSelfAttention(BaseModule):
              Tensor: forwarded results with shape [num_query, bs, embed_dims].
         """
 
+        # 원래 value: prev bev, query의 stack
+        # value가 None이면 query를 두 번 stack
         if value is None:
             assert self.batch_first
             bs, len_bev, c = query.shape
@@ -183,6 +185,8 @@ class TemporalSelfAttention(BaseModule):
 
         if identity is None:
             identity = query
+            
+        # 쿼리에 포지셔널 임베딩을 더함
         if query_pos is not None:
             query = query + query_pos
         if not self.batch_first:
@@ -194,20 +198,29 @@ class TemporalSelfAttention(BaseModule):
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
         assert self.num_bev_queue == 2
 
+        # prev bev, query의 concat -> value뿐만 아니라 query에도 과거 정보를 포함한다.
         query = torch.cat([value[:bs], query], -1)
+        # value -> linear layer를 거쳐 가중치가 곱해짐
         value = self.value_proj(value)
 
+        # 이것도 아마 디폴트는 None인 듯
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
 
         value = value.reshape(bs*self.num_bev_queue,
                               num_value, self.num_heads, -1)
-
+        
+        # Deformable attentions에 필요한 reference point 주위로의 offset
+        # self.sampling_offsets: Linear layer
         sampling_offsets = self.sampling_offsets(query)
         sampling_offsets = sampling_offsets.view(
             bs, num_query, self.num_heads,  self.num_bev_queue, self.num_levels, self.num_points, 2)
+        
+        # self.attention_weights: Linear layer
         attention_weights = self.attention_weights(query).view(
             bs, num_query,  self.num_heads, self.num_bev_queue, self.num_levels * self.num_points)
+        
+        # softmax를 통한 정규화
         attention_weights = attention_weights.softmax(-1)
 
         attention_weights = attention_weights.view(bs, num_query,
@@ -224,6 +237,8 @@ class TemporalSelfAttention(BaseModule):
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack(
                 [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            
+            # sampling_locations = reference_points + (sampling_offsets / offset_normalizer)
             sampling_locations = reference_points[:, :, None, :, None, :] \
                 + sampling_offsets \
                 / offset_normalizer[None, None, None, :, None, :]
@@ -238,12 +253,15 @@ class TemporalSelfAttention(BaseModule):
                 f'Last dim of reference_points must be'
                 f' 2 or 4, but get {reference_points.shape[-1]} instead.')
         if torch.cuda.is_available() and value.is_cuda:
-
+            
+            # Deformable attention: MultiScaleDeformableAttnFunction_fp32
             # using fp16 deformable attention is unstable because it performs many sum operations
             if value.dtype == torch.float16:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
             else:
                 MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
+            
+            # Deformable attention forward
             output = MultiScaleDeformableAttnFunction.apply(
                 value, spatial_shapes, level_start_index, sampling_locations,
                 attention_weights, self.im2col_step)
@@ -269,4 +287,5 @@ class TemporalSelfAttention(BaseModule):
         if not self.batch_first:
             output = output.permute(1, 0, 2)
 
+        # 왜 더하냐? : Residual connection!
         return self.dropout(output) + identity
